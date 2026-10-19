@@ -1,0 +1,33 @@
+# Copy to config.yaml, or run `nvr-event-push` to create it interactively.
+nvr:
+  host: 192.168.1.64
+  port: 80
+  https: false
+  verify_tls: false
+  username: admin
+  password: ""          # or set the NVR_PASSWORD environment variable
+  auth: digest          # digest (standard) or basic
+
+defaults:
+  cooldown_seconds: 30  # min seconds between requests per rule + camera
+  timeout_seconds: 5    # HTTP timeout for the outgoing GET
+
+rules:
+  - name: Driveway lights
+    channels: [1, 3]                     # NVR channel numbers; [] = all cameras
+    event_types: [VMD, linedetection]    # VMD, linedetection, fielddetection, regionEntrance, regionExiting
+    targets: [human, vehicle]            # [] = any; needs AcuSense cameras that report targets
+    url: "http://192.168.1.50:8080/motion?camera={camera_name}&event={event_type}&target={target}"
+    cooldown_seconds: 60                 # optional per-rule override
+    enabled: true
+
+  - name: Home Assistant webhook
+    channels: [2]
+    event_types: [VMD]
+    url: "http://homeassistant.local:8123/api/webhook/front_door_motion?ts={timestamp}"
+
+# Channel names, refreshed from the NVR automatically.
+cameras:
+  1: Driveway
+  2: Front Door
+  3: Backyard
