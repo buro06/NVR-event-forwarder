@@ -57,6 +57,7 @@ class NvrConfig:
 class Defaults:
     cooldown_seconds: float = 30.0
     timeout_seconds: float = 5.0
+    retries: int = 2  # extra attempts after a connection error, timeout or HTTP 5xx/429
 
 
 @dataclass
@@ -68,6 +69,10 @@ class Rule:
     targets: list[str] = field(default_factory=list)  # empty = any target
     cooldown_seconds: float | None = None
     enabled: bool = True
+    # Optional second GET, sent once no matching event has arrived for
+    # off_delay_seconds (e.g. to turn the light back off).
+    off_url: str = ""
+    off_delay_seconds: float = 120.0
 
 
 @dataclass
@@ -110,6 +115,8 @@ def validate_url_template(url: str) -> None:
 
 
 def validate(config: Config) -> None:
+    if config.defaults.retries < 0:
+        raise ConfigError("defaults.retries must be 0 or more")
     names = set()
     for rule in config.rules:
         if not rule.name:
@@ -123,18 +130,29 @@ def validate(config: Config) -> None:
             validate_url_template(rule.url)
         except ConfigError as exc:
             raise ConfigError(f"Rule '{rule.name}': {exc}") from None
+        if rule.off_url:
+            try:
+                validate_url_template(rule.off_url)
+            except ConfigError as exc:
+                raise ConfigError(f"Rule '{rule.name}' off URL: {exc}") from None
+            if rule.off_delay_seconds <= 0:
+                raise ConfigError(f"Rule '{rule.name}': off delay must be more than 0 seconds")
 
 
 def _from_dict(data: dict) -> Config:
     try:
         nvr = NvrConfig(**(data.get("nvr") or {}))
         defaults = Defaults(**(data.get("defaults") or {}))
+        defaults.retries = int(defaults.retries)
         rules = []
         for r in data.get("rules") or []:
             r = dict(r)
             r["channels"] = [int(c) for c in r.get("channels") or []]
             r["event_types"] = [str(e) for e in r.get("event_types") or []]
             r["targets"] = [str(t).lower() for t in r.get("targets") or []]
+            r["off_url"] = str(r.get("off_url") or "")
+            if "off_delay_seconds" in r:
+                r["off_delay_seconds"] = float(r["off_delay_seconds"])
             rules.append(Rule(**r))
         cameras = {int(k): str(v) for k, v in (data.get("cameras") or {}).items()}
     except (TypeError, ValueError) as exc:
@@ -161,6 +179,8 @@ def save(config: Config, path: str | os.PathLike | None = None) -> Path:
     for rule in data["rules"]:
         if rule["cooldown_seconds"] is None:
             del rule["cooldown_seconds"]
+        if not rule["off_url"]:
+            del rule["off_url"], rule["off_delay_seconds"]
     tmp = p.with_name(p.name + ".tmp")
     # The file holds the NVR password, so keep it private to the owner.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

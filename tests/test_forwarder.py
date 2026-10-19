@@ -1,6 +1,7 @@
 from unittest import mock
 
 import pytest
+import requests
 
 from nvr_event_push.config import Config, ConfigError, NvrConfig, Rule, load, save
 from nvr_event_push.config import validate_url_template
@@ -103,3 +104,165 @@ def test_password_env_override(monkeypatch):
     assert nvr.effective_password == "file"
     monkeypatch.setenv("NVR_PASSWORD", "env")
     assert nvr.effective_password == "env"
+
+
+class FakeTimer:
+    def __init__(self, delay, fn):
+        self.delay, self.fn, self.cancelled = delay, fn, False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def off_forwarder(config, now):
+    timers = []
+
+    def factory(delay, fn):
+        timers.append(FakeTimer(delay, fn))
+        return timers[-1]
+
+    session = mock.Mock()
+    session.get.return_value = mock.Mock(ok=True, status_code=200)
+    fwd = Forwarder(config, session=session, max_workers=1, clock=lambda: now[0],
+                    timer_factory=factory)
+    return fwd, session, timers
+
+
+def urls(session):
+    return [c.args[0] for c in session.get.call_args_list]
+
+
+def test_off_after_delay_and_reset_by_new_events():
+    config = make_config(cooldown_seconds=60, off_url="http://h/off?cam={camera_name}",
+                         off_delay_seconds=30)
+    now = [0.0]
+    fwd, session, timers = off_forwarder(config, now)
+
+    fwd.handle(ev())
+    now[0] += 10
+    assert fwd.handle(ev()) == []  # in cooldown, but still restarts the off countdown
+    assert len(timers) == 2 and timers[0].cancelled and timers[1].delay == 30
+    timers[0].fn()  # a cancelled timer that fires anyway does nothing
+    timers[1].fn()
+    fwd._pool.shutdown(wait=True)
+    assert urls(session)[-1] == "http://h/off?cam=Front%20Door"
+    assert session.get.call_count == 2
+    fwd.shutdown()
+    assert session.get.call_count == 2  # nothing left pending
+
+
+def test_off_clears_cooldown_and_shutdown_sends_pending():
+    config = make_config(cooldown_seconds=60, off_url="http://h/off", off_delay_seconds=30)
+    now = [0.0]
+    fwd, session, timers = off_forwarder(config, now)
+
+    for f in fwd.handle(ev()):
+        f.result()
+    timers[-1].fn()
+    now[0] += 35  # well inside the 60 s cooldown
+    assert len(fwd.handle(ev())) == 1
+    fwd.shutdown()  # sends the pending off instead of leaving the light on
+    assert [u.split("?")[0] for u in urls(session)] == [
+        "http://h/m", "http://h/off", "http://h/m", "http://h/off"
+    ]
+
+
+def test_off_timer_shared_unless_url_is_per_camera():
+    shared = make_config(off_url="http://h/off?ts={timestamp}")
+    fwd, _, timers = off_forwarder(shared, [0.0])
+    fwd.handle(ev(1))
+    fwd.handle(ev(2))
+    assert timers[0].cancelled and not timers[1].cancelled
+    fwd.shutdown()
+
+    per_cam = make_config(off_url="http://h/off?ch={channel}")
+    fwd, _, timers = off_forwarder(per_cam, [0.0])
+    fwd.handle(ev(1))
+    fwd.handle(ev(2))
+    assert not timers[0].cancelled and not timers[1].cancelled
+    fwd.shutdown()
+
+
+def test_off_url_validation_and_roundtrip(tmp_path):
+    config = make_config(off_url="http://h/{nope}")
+    path = save(config, tmp_path / "c.yaml")
+    with pytest.raises(ConfigError, match="off URL"):
+        load(path)
+    config = make_config(off_url="http://h/off", off_delay_seconds=45)
+    assert load(save(config, tmp_path / "c.yaml")) == config
+    plain = make_config()
+    path = save(plain, tmp_path / "plain.yaml")
+    assert "off_url" not in path.read_text()
+
+
+def retry_forwarder(responses, retries=2):
+    config = make_config()
+    config.defaults.retries = retries
+    session = mock.Mock()
+    session.get.side_effect = responses
+    sleeps = []
+    fwd = Forwarder(config, session=session, sleep=sleeps.append)
+    return fwd, session, sleeps
+
+
+def test_retries_transient_errors_then_succeeds():
+    ok = mock.Mock(ok=True, status_code=200)
+    fwd, session, sleeps = retry_forwarder(
+        [requests.ConnectionError("refused"), mock.Mock(ok=False, status_code=503), ok]
+    )
+    assert fwd.fire(config_rule(fwd), ev()).result() is ok
+    fwd.shutdown()
+    assert session.get.call_count == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_gives_up_after_retries():
+    fwd, session, sleeps = retry_forwarder([requests.Timeout("slow")] * 3)
+    assert fwd.fire(config_rule(fwd), ev()).result() is None
+    fwd.shutdown()
+    assert session.get.call_count == 3
+
+    last = mock.Mock(ok=False, status_code=500)
+    fwd, session, _ = retry_forwarder([mock.Mock(ok=False, status_code=500)] * 2 + [last])
+    assert fwd.fire(config_rule(fwd), ev()).result() is last
+    fwd.shutdown()
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_no_retry_on_success_or_client_error(status):
+    resp = mock.Mock(ok=status < 400, status_code=status)
+    fwd, session, sleeps = retry_forwarder([resp])
+    assert fwd.fire(config_rule(fwd), ev()).result() is resp
+    fwd.shutdown()
+    assert session.get.call_count == 1 and sleeps == []
+
+
+def test_retries_disabled():
+    fwd, session, sleeps = retry_forwarder([requests.ConnectionError("refused")], retries=0)
+    assert fwd.fire(config_rule(fwd), ev()).result() is None
+    fwd.shutdown()
+    assert session.get.call_count == 1 and sleeps == []
+
+
+def config_rule(fwd):
+    return fwd.config.rules[0]
+
+
+def test_cooldown_repeats_logged_once(caplog):
+    config = make_config(cooldown_seconds=30)
+    now = [0.0]
+    fwd = Forwarder(config, session=mock.Mock(), clock=lambda: now[0])
+    with caplog.at_level("DEBUG", logger="nvr_event_push.forwarder"):
+        fwd.handle(ev())
+        for _ in range(10):
+            now[0] += 1
+            fwd.handle(ev())
+        now[0] += 30
+        fwd.handle(ev())
+    fwd.shutdown()
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("ignoring repeats" in m for m in messages) == 1
+    assert any("10 repeat(s) ignored" in m for m in messages)

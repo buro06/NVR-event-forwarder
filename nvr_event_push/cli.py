@@ -85,7 +85,10 @@ def cmd_test_url(args) -> int:
         names = ", ".join(repr(r.name) for r in config.rules) or "none"
         print(f"No rule named {args.rule!r}. Rules: {names}", file=sys.stderr)
         return 1
-    resp = runner.send_test(config, rule)
+    if args.off and not rule.off_url:
+        print(f"Rule {args.rule!r} has no off URL", file=sys.stderr)
+        return 1
+    resp = runner.send_test(config, rule, off=args.off)
     return 0 if resp is not None and resp.ok else 1
 
 
@@ -136,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = sub.add_parser("test-url", parents=[common], help="send one test request for a rule")
     p.add_argument("rule", help="rule name")
+    p.add_argument("--off", action="store_true", help="send the rule's off request instead")
     p.set_defaults(func=cmd_test_url)
     return parser
 

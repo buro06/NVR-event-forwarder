@@ -278,6 +278,9 @@ class Menu:
     def _rule_actions(self, rule: Rule) -> None:
         print(f"  URL:      {rule.url}")
         print(f"  Cooldown: {self.config.cooldown_for(rule):g}s")
+        if rule.off_url:
+            print(f"  Off URL:  {rule.off_url} (after {rule.off_delay_seconds:g}s)")
+        test_off = [Choice("Send a test 'off' request", "test_off")] if rule.off_url else []
         action = ask(
             questionary.select(
                 f"Rule '{rule.name}':",
@@ -285,6 +288,7 @@ class Menu:
                     Choice("Edit", "edit"),
                     Choice("Disable" if rule.enabled else "Enable", "toggle"),
                     Choice("Send a test request", "test"),
+                    *test_off,
                     Choice("Delete", "delete"),
                     Choice("← Back", "back"),
                 ],
@@ -300,6 +304,8 @@ class Menu:
             self.save()
         elif action == "test":
             self._send_test(rule)
+        elif action == "test_off":
+            self._send_test(rule, off=True)
         elif action == "delete":
             if ask(questionary.confirm(f"Delete rule '{rule.name}'?", default=False)):
                 self.config.rules.remove(rule)
@@ -378,6 +384,30 @@ class Menu:
         rule.cooldown_seconds = (
             None if cooldown_value == self.config.defaults.cooldown_seconds else cooldown_value
         )
+
+        if ask(
+            questionary.confirm(
+                "Also send an 'off' request once events stop?", default=bool(rule.off_url)
+            )
+        ):
+            rule.off_url = ask(
+                questionary.text(
+                    "Off URL to GET:",
+                    default=rule.off_url or rule.url.replace("motion", "off"),
+                    validate=check_url,
+                )
+            ).strip()
+            rule.off_delay_seconds = float(
+                ask(
+                    questionary.text(
+                        "Seconds after the last event before sending it:",
+                        default=f"{rule.off_delay_seconds:g}",
+                        validate=_is_positive_number,
+                    )
+                )
+            )
+        else:
+            rule.off_url = ""
         return rule
 
     def _ask_channels(self, current: list[int]) -> list[int]:
@@ -420,8 +450,8 @@ class Menu:
         if ask(questionary.confirm("Send a test request now?", default=True)):
             self._send_test(rule)
 
-    def _send_test(self, rule: Rule) -> None:
-        resp = runner.send_test(self.config, rule)
+    def _send_test(self, rule: Rule, off: bool = False) -> None:
+        resp = runner.send_test(self.config, rule, off=off)
         if resp is None:
             error("Request failed (see the log line above).")
         elif resp.ok:
@@ -433,6 +463,13 @@ class Menu:
 def _is_non_negative_number(s: str):
     try:
         return float(s) >= 0 or "Must be 0 or more"
+    except ValueError:
+        return "Enter a number"
+
+
+def _is_positive_number(s: str):
+    try:
+        return float(s) > 0 or "Must be more than 0"
     except ValueError:
         return "Enter a number"
 

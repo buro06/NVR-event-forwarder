@@ -11,6 +11,7 @@ nvr:
 defaults:
   cooldown_seconds: 30  # min seconds between requests per rule + camera
   timeout_seconds: 5    # HTTP timeout for the outgoing GET
+  retries: 2            # retries after a connection error, timeout or HTTP 5xx/429
 
 rules:
   - name: Driveway lights
@@ -19,6 +20,8 @@ rules:
     targets: [human, vehicle]            # [] = any; needs AcuSense cameras that report targets
     url: "http://192.168.1.50:8080/motion?camera={camera_name}&event={event_type}&target={target}"
     cooldown_seconds: 60                 # optional per-rule override
+    off_url: "http://192.168.1.50:8080/off?camera={camera_name}"   # optional: sent once events stop
+    off_delay_seconds: 120               # ...this many seconds after the last matching event
     enabled: true
 
   - name: Home Assistant webhook

@@ -96,12 +96,12 @@ def sample_event(config: Config, rule: Rule) -> Event:
     )
 
 
-def send_test(config: Config, rule: Rule) -> requests.Response | None:
-    """Fire the rule's request once with a synthetic event (no cooldown)."""
+def send_test(config: Config, rule: Rule, off: bool = False) -> requests.Response | None:
+    """Fire the rule's request (or its off request) once with a synthetic event."""
     if not config.cameras and config.nvr.host:
         refresh_cameras(config)
     forwarder = Forwarder(config, max_workers=1)
     try:
-        return forwarder.fire(rule, sample_event(config, rule)).result()
+        return forwarder.fire(rule, sample_event(config, rule), off=off).result()
     finally:
         forwarder.shutdown()

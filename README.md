@@ -26,7 +26,7 @@ nvr-event-push            # interactive menu: set up NVR, rules, test, watch, ru
 nvr-event-push run        # headless: listen and forward (for services)
 nvr-event-push watch      # print live events without forwarding (--raw for XML)
 nvr-event-push cameras    # list channel numbers and names
-nvr-event-push test-url "Driveway lights"   # fire one test request for a rule
+nvr-event-push test-url "Driveway lights"   # fire one test request for a rule (--off for its off URL)
 ```
 
 Every command accepts `-c/--config PATH` (default `./config.yaml` or `$NVR_EVENT_PUSH_CONFIG`) and `-v` for debug logging. The password can come from `$NVR_PASSWORD` instead of the file.
@@ -53,6 +53,11 @@ Each rule has:
   | `{rule_name}` | Rule name |
 
 - **cooldown**: The NVR repeats "active" about once a second while motion continues. Each rule sends at most one request per camera per cooldown window. Requests are only sent when motion **starts**, never when it ends.
+- **off_url** (optional) and **off_delay_seconds** (default 120): a second GET sent once no matching event has arrived for `off_delay_seconds`. Every matching event restarts the countdown, including events inside the cooldown, so the light stays on while motion continues. It accepts the same placeholders as `url`. When the off request is sent, the cooldown is reset so the next motion turns the light back on right away. Cameras whose off URL comes out the same (one light watched by several cameras) share one countdown, so the light stays on until all of them are quiet. Putting `{camera_name}` or `{channel}` in the off URL gives each camera its own countdown. On shutdown, any pending off requests are sent right away. Test one with `test-url --off "Rule name"`.
+
+### Retries
+
+If a request fails with a connection error, a timeout, or HTTP 5xx/429, it is retried `defaults.retries` times (default 2). The wait between attempts starts at 1 second and doubles each time. Other 4xx responses, such as a wrong URL or a rejected token, are not retried, because they would fail the same way again. Set `retries: 0` to turn retries off.
 
 ## Run as a service
 
