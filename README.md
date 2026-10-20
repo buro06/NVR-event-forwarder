@@ -29,9 +29,12 @@ Use an NVR user that has remote access. Standard Digest authentication is suppor
 nvr-event-push            # interactive menu: set up NVRs, rules, test, watch, run
 nvr-event-push run        # headless: listen and forward (for services)
 nvr-event-push watch      # print live events without forwarding (--raw for XML)
+nvr-event-push watch --nvr Garage --event VMD,linedetection   # only these NVRs / event types
 nvr-event-push cameras    # list channel numbers and names on each NVR
 nvr-event-push test-url "Driveway lights"   # fire one test request for a rule (--off for its off URL)
 ```
+
+`watch` shows everything by default. `--nvr NAME` limits it to certain NVRs (only those are connected to), and `--event TYPE` limits it to certain event types. Both can be repeated or comma-separated. The menu's *Watch live events* asks the same questions and remembers your last answers.
 
 Every command accepts `-c/--config PATH` (default `./config.yaml` or `$NVR_EVENT_PUSH_CONFIG`) and `-v` for debug logging.
 

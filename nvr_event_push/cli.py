@@ -58,11 +58,24 @@ def cmd_run(args) -> int:
     return 0
 
 
+def _split_list(values: list[str] | None) -> list[str]:
+    """Flatten repeated and comma-separated option values."""
+    return [v.strip() for value in values or [] for v in value.split(",") if v.strip()]
+
+
 def cmd_watch(args) -> int:
     config = _load_or_exit(args.config)
-    print("Watching events (Ctrl+C to stop)...", flush=True)
+    nvrs = _split_list(args.nvr)
+    unknown = [n for n in nvrs if config.get_nvr(n) is None]
+    if unknown:
+        names = ", ".join(repr(n.name) for n in config.nvrs)
+        print(f"Unknown NVR {', '.join(map(repr, unknown))}. NVRs: {names}", file=sys.stderr)
+        return 2
+    event_types = _split_list(args.event)
+    summary = runner.describe_watch(config, nvrs, event_types)
+    print(f"Watching {summary} (Ctrl+C to stop)...", flush=True)
     try:
-        runner.watch(config, show_all=args.all, raw=args.raw)
+        runner.watch(config, show_all=args.all, raw=args.raw, nvrs=nvrs, event_types=event_types)
     except AuthError as exc:
         logging.error("%s", exc)
         return 2
@@ -147,6 +160,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("watch", parents=[common], help="print live events without forwarding")
     p.add_argument("--all", action="store_true", help="include idle heartbeat messages")
     p.add_argument("--raw", action="store_true", help="also print the raw event XML/JSON")
+    p.add_argument(
+        "--nvr",
+        action="append",
+        metavar="NAME",
+        help="only watch this NVR (repeat or comma-separate for several)",
+    )
+    p.add_argument(
+        "--event",
+        action="append",
+        metavar="TYPE",
+        help="only show this event type, e.g. VMD (repeat or comma-separate for several)",
+    )
     p.set_defaults(func=cmd_watch)
     sub.add_parser("cameras", parents=[common], help="list cameras on each NVR").set_defaults(
         func=cmd_cameras

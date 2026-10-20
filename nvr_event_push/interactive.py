@@ -80,6 +80,8 @@ class Menu:
         except ConfigError as exc:
             error(f"{self.path} is invalid ({exc}); starting with an empty config.")
             self.config = Config()
+        # Last watch filter (NVR names, event types), offered as the default next time.
+        self._watch_filter: tuple[list[str], list[str]] = ([], [])
 
     def save(self) -> None:
         save(self.config, self.path)
@@ -134,15 +136,69 @@ class Menu:
     def action_watch(self) -> None:
         if not self._require_nvr():
             return
+        nvrs = self._ask_watch_nvrs()
+        event_types = self._ask_watch_events()
+        self._watch_filter = (nvrs, event_types)
         show_all = ask(questionary.confirm("Include idle heartbeat messages?", default=False))
         raw = ask(questionary.confirm("Show raw event data?", default=False))
-        info("Watching events. Press Ctrl+C to return to the menu.")
+        summary = runner.describe_watch(self.config, nvrs, event_types)
+        info(f"Watching {summary}. Press Ctrl+C to return to the menu.")
         try:
-            runner.watch(self.config, show_all=show_all, raw=raw)
+            runner.watch(
+                self.config, show_all=show_all, raw=raw, nvrs=nvrs, event_types=event_types
+            )
         except AuthError as exc:
             error(str(exc))
         except KeyboardInterrupt:
             info("\nStopped.")
+
+    def _ask_watch_nvrs(self) -> list[str]:
+        """Which NVRs to watch; an empty list means all of them."""
+        if len(self.config.nvrs) < 2:
+            return []
+        last = self._watch_filter[0]
+        picked = ask(
+            questionary.checkbox(
+                "Watch which NVRs? (space to select)",
+                choices=[
+                    Choice(n.name, n.name, checked=not last or n.name in last)
+                    for n in self.config.nvrs
+                ],
+                validate=lambda sel: bool(sel) or "Pick at least one",
+            )
+        )
+        return [] if len(picked) == len(self.config.nvrs) else picked
+
+    def _ask_watch_events(self) -> list[str]:
+        """Which event types to show; an empty list means all of them."""
+        last = self._watch_filter[1]
+        scope = ask(
+            questionary.select(
+                "Which events?",
+                choices=[
+                    Choice("All events", "all"),
+                    Choice("Only certain event types", "some"),
+                ],
+                default="some" if last else "all",
+            )
+        )
+        if scope == "all":
+            return []
+        # Offer the standard types plus any custom ones used in rules.
+        types = dict(EVENT_TYPES)
+        for rule in self.config.rules:
+            for e in rule.event_types:
+                types.setdefault(e, e)
+        return ask(
+            questionary.checkbox(
+                "Show which event types? (space to select)",
+                choices=[
+                    Choice(code if label == code else f"{label} ({code})", code, checked=code in last)
+                    for code, label in types.items()
+                ],
+                validate=lambda sel: bool(sel) or "Pick at least one",
+            )
+        )
 
     def action_cameras(self) -> None:
         if not self._require_nvr():

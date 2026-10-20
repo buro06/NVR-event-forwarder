@@ -11,7 +11,7 @@ import requests
 
 from .client import NvrError, listen_all, make_client
 from .config import Config, NvrConfig, Rule
-from .events import Event
+from .events import EVENT_TYPES, Event
 from .forwarder import Forwarder
 
 log = logging.getLogger(__name__)
@@ -77,21 +77,47 @@ def format_event(config: Config, event: Event) -> str:
     return "  ".join(parts)
 
 
+def describe_watch(
+    config: Config, nvrs: list[str] | None = None, event_types: list[str] | None = None
+) -> str:
+    """What a watch with these filters shows, e.g. "Motion detection events from Garage"."""
+    if event_types:
+        text = ", ".join(EVENT_TYPES.get(e, e) for e in event_types) + " events"
+    else:
+        text = "all events"
+    if nvrs:
+        text += " from " + ", ".join(nvrs)
+    elif len(config.nvrs) > 1:
+        text += " from all NVRs"
+    return text
+
+
 def watch(
     config: Config,
     show_all: bool = False,
     raw: bool = False,
     out: Callable[[str], None] | None = None,
+    nvrs: list[str] | None = None,
+    event_types: list[str] | None = None,
 ) -> None:
-    """Print events as they arrive, without forwarding. Runs until interrupted."""
+    """Print events as they arrive, without forwarding. Runs until interrupted.
+
+    ``nvrs`` limits which NVRs are watched (by name) and ``event_types`` which
+    event types are printed; None or empty means no filter.
+    """
     # Flush every line so output piped to a file or `tee` appears immediately.
     out = out or (lambda line: print(line, flush=True))
-    refresh_cameras(config)
+    watched = [n for n in config.nvrs if not nvrs or n.name in nvrs]
+    wanted = {e.lower() for e in event_types or ()}
+    refresh_cameras(config, watched)
     # Events arrive on one thread per NVR; keep each event's lines together.
     lock = threading.Lock()
 
     def on_event(event: Event) -> None:
-        if event.is_heartbeat and not show_all:
+        if event.is_heartbeat:
+            if not show_all:
+                return
+        elif wanted and event.event_type.lower() not in wanted:
             return
         with lock:
             out(format_event(config, event))
@@ -99,7 +125,7 @@ def watch(
             if raw and event.raw:
                 out(event.raw.strip() + "\n")
 
-    listen_all(config.nvrs, on_event)
+    listen_all(watched, on_event)
 
 
 def sample_event(config: Config, rule: Rule) -> Event:
