@@ -9,7 +9,7 @@ import sys
 
 from . import __version__, runner
 from .config import ConfigError, load, resolve_path
-from .isapi import AuthError, NvrClient, NvrError
+from .client import AuthError, NvrError, make_client
 
 
 def setup_logging(verbose: bool) -> None:
@@ -22,9 +22,9 @@ def setup_logging(verbose: bool) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
-def _load_or_exit(path):
+def _load_or_exit(path, need_nvr: bool = True):
     try:
-        return load(path)
+        config = load(path)
     except FileNotFoundError:
         print(
             f"No config found at {resolve_path(path)}. "
@@ -33,6 +33,14 @@ def _load_or_exit(path):
         )
     except ConfigError as exc:
         print(f"Config error in {resolve_path(path)}: {exc}", file=sys.stderr)
+    else:
+        if config.nvrs or not need_nvr:
+            return config
+        print(
+            f"No NVR configured in {resolve_path(path)}. "
+            "Run `nvr-event-push` (no arguments) to add one.",
+            file=sys.stderr,
+        )
     sys.exit(2)
 
 
@@ -65,21 +73,26 @@ def cmd_watch(args) -> int:
 
 def cmd_cameras(args) -> int:
     config = _load_or_exit(args.config)
-    try:
-        cameras = NvrClient(config.nvr).list_channels()
-    except NvrError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-    if not cameras:
-        print("The NVR did not report any channels.")
-        return 1
-    for cid, name in cameras.items():
-        print(f"{cid:>3}  {name}")
-    return 0
+    status = 0
+    for nvr in config.nvrs:
+        if len(config.nvrs) > 1:
+            print(f"{nvr.name} ({nvr.host}):")
+        try:
+            cameras = make_client(nvr).list_channels()
+        except NvrError as exc:
+            print(exc, file=sys.stderr)
+            status = 1
+            continue
+        if not cameras:
+            print("The NVR did not report any channels.")
+            status = 1
+        for cid, name in cameras.items():
+            print(f"{cid:>3}  {name}")
+    return status
 
 
 def cmd_test_url(args) -> int:
-    config = _load_or_exit(args.config)
+    config = _load_or_exit(args.config, need_nvr=False)
     rule = next((r for r in config.rules if r.name == args.rule), None)
     if rule is None:
         names = ", ".join(repr(r.name) for r in config.rules) or "none"
@@ -117,7 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     common = _common_options(suppress_defaults=True)
     parser = argparse.ArgumentParser(
         prog="nvr-event-push",
-        description="Forward Hikvision/Annke NVR motion events to HTTP GET requests. "
+        description="Forward Hikvision/Annke or Dahua/Amcrest NVR motion events to HTTP GET "
+        "requests. "
         "Run without a command for the interactive menu.",
         parents=[_common_options(suppress_defaults=False)],
     )
@@ -134,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="include idle heartbeat messages")
     p.add_argument("--raw", action="store_true", help="also print the raw event XML/JSON")
     p.set_defaults(func=cmd_watch)
-    sub.add_parser("cameras", parents=[common], help="list cameras on the NVR").set_defaults(
+    sub.add_parser("cameras", parents=[common], help="list cameras on each NVR").set_defaults(
         func=cmd_cameras
     )
     p = sub.add_parser("test-url", parents=[common], help="send one test request for a rule")

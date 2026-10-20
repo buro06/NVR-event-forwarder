@@ -49,6 +49,7 @@ class Event:
     timestamp: str = ""
     target: str | None = None
     description: str = ""
+    nvr: str = ""  # name of the NVR it came from, set by the client
     raw: str = field(default="", repr=False, compare=False)
 
     @property
@@ -57,8 +58,9 @@ class Event:
 
     @property
     def is_heartbeat(self) -> bool:
-        # Idle NVRs emit "videoloss / inactive" every few seconds as a keep-alive.
-        return self.event_type.lower() == "videoloss" and not self.active
+        # Idle Hikvision NVRs emit "videoloss / inactive" every few seconds as a
+        # keep-alive; the Dahua parser reports its heartbeats as "heartbeat".
+        return self.event_type.lower() in ("videoloss", "heartbeat") and not self.active
 
     @property
     def label(self) -> str:

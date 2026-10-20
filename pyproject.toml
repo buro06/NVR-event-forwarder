@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nvr-event-push"
 version = "0.1.0"
-description = "Forward Hikvision/Annke NVR motion and smart events to HTTP GET webhooks"
+description = "Forward Hikvision/Annke and Dahua/Amcrest NVR motion and smart events to HTTP GET webhooks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

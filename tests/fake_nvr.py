@@ -1,16 +1,18 @@
-"""A tiny fake Hikvision NVR for testing without hardware.
+"""A tiny fake Hikvision or Dahua NVR for testing without hardware.
 
-Serves deviceInfo, the channel list and a multipart alertStream behind HTTP
+Serves device info, the channel list and a multipart event stream behind HTTP
 Digest auth. The stream cycles through the configured channels, emitting a
-burst of "active" motion events followed by idle heartbeats.
+burst of motion followed by idle heartbeats.
 
     python tests/fake_nvr.py --port 8099 --user admin --password secret
+    python tests/fake_nvr.py --brand dahua
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import secrets
 import threading
 import time
@@ -53,11 +55,24 @@ def alert_xml(channel: int, event_type: str, state: str, target: str | None = No
     )
 
 
+def dahua_record(channel: int, code: str, action: str, target: str | None = None) -> str:
+    record = f"Code={code};action={action};index={channel - 1}"
+    if target:
+        data = {
+            "LocaleTime": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "Object": {"ObjectType": target.capitalize()},
+        }
+        record += ";data=" + json.dumps(data, indent=3)
+    return record
+
+
 def _md5(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()
 
 
-def make_handler(user: str, password: str, interval: float, burst: int, cameras: dict[int, str]):
+def make_handler(
+    user: str, password: str, interval: float, burst: int, cameras: dict[int, str], brand: str
+):
     realm = "fake-nvr"
 
     class Handler(BaseHTTPRequestHandler):
@@ -102,9 +117,24 @@ def make_handler(user: str, password: str, interval: float, burst: int, cameras:
             self.end_headers()
             self.wfile.write(data)
 
+        def _text(self, body: str) -> None:
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _not_found(self) -> None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             if not self._authorized():
                 return self._challenge()
+            if brand == "dahua":
+                return self._dahua_get()
             if self.path == "/ISAPI/System/deviceInfo":
                 return self._xml(
                     "<DeviceInfo><deviceName>Fake NVR</deviceName><model>DS-FAKE</model>"
@@ -121,9 +151,25 @@ def make_handler(user: str, password: str, interval: float, burst: int, cameras:
                 )
             if self.path == "/ISAPI/Event/notification/alertStream":
                 return self._stream()
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._not_found()
+
+        def _dahua_get(self) -> None:
+            if self.path == "/cgi-bin/magicBox.cgi?action=getSystemInfo":
+                return self._text("deviceType=DH-FAKE\r\nserialNumber=0000\r\n")
+            if self.path == "/cgi-bin/magicBox.cgi?action=getSoftwareVersion":
+                return self._text("version=4.000.0000000.0.R,build:2026-01-01\r\n")
+            if self.path == "/cgi-bin/magicBox.cgi?action=getMachineName":
+                return self._text("name=Fake Dahua NVR\r\n")
+            if self.path == "/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle":
+                return self._text(
+                    "".join(
+                        f"table.ChannelTitle[{cid - 1}].Name={name}\r\n"
+                        for cid, name in cameras.items()
+                    )
+                )
+            if self.path.startswith("/cgi-bin/eventManager.cgi?action=attach"):
+                return self._dahua_stream()
+            self._not_found()
 
         def _send_part(self, xml: str) -> None:
             data = xml.encode()
@@ -156,6 +202,47 @@ def make_handler(user: str, password: str, interval: float, burst: int, cameras:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def _send_dahua_part(self, body: str) -> None:
+            data = body.encode()
+            self.wfile.write(
+                f"--myboundary\r\nContent-Type: text/plain\r\nContent-Length: {len(data)}\r\n\r\n".encode()
+                + data
+                + b"\r\n\r\n"
+            )
+            self.wfile.flush()
+
+        def _dahua_stream(self) -> None:
+            # Dahua sends Start / Stop around motion (heartbeats in between)
+            # and a Pulse per line crossing.
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=myboundary")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            channels = list(cameras)
+            i = 0
+            try:
+                while True:
+                    ch = channels[i % len(channels)]
+                    if i % 2 == 0:
+                        self._send_dahua_part(dahua_record(ch, "VideoMotion", "Start"))
+                        for _ in range(burst - 1):
+                            time.sleep(interval)
+                            self._send_dahua_part("Heartbeat")
+                        time.sleep(interval)
+                        self._send_dahua_part(dahua_record(ch, "VideoMotion", "Stop"))
+                    else:
+                        for _ in range(burst):
+                            self._send_dahua_part(
+                                dahua_record(ch, "CrossLineDetection", "Pulse", "human")
+                            )
+                            time.sleep(interval)
+                    for _ in range(burst):
+                        self._send_dahua_part("Heartbeat")
+                        time.sleep(interval)
+                    i += 1
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     return Handler
 
 
@@ -166,9 +253,10 @@ def serve(
     interval: float = 1.0,
     burst: int = 3,
     cameras: dict[int, str] | None = None,
+    brand: str = "hikvision",
 ) -> ThreadingHTTPServer:
     """Start the fake NVR in a background thread and return the server."""
-    handler = make_handler(user, password, interval, burst, cameras or CAMERAS)
+    handler = make_handler(user, password, interval, burst, cameras or CAMERAS, brand)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -182,9 +270,12 @@ def main() -> None:
     p.add_argument("--password", default="secret")
     p.add_argument("--interval", type=float, default=1.0, help="seconds between messages")
     p.add_argument("--burst", type=int, default=5, help="messages per motion burst / idle period")
+    p.add_argument("--brand", choices=["hikvision", "dahua"], default="hikvision")
     args = p.parse_args()
-    server = serve(args.port, args.user, args.password, args.interval, args.burst)
-    print(f"Fake NVR on http://127.0.0.1:{server.server_port} (user {args.user!r}, password {args.password!r})")
+    server = serve(
+        args.port, args.user, args.password, args.interval, args.burst, brand=args.brand
+    )
+    print(f"Fake {args.brand} NVR on http://127.0.0.1:{server.server_port} (user {args.user!r}, password {args.password!r})")
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

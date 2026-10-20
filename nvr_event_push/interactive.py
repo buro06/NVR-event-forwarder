@@ -9,10 +9,14 @@ import questionary
 from questionary import Choice
 
 from . import runner
+from .client import AuthError, NvrError, make_client
 from .config import (
+    BRANDS,
+    DEFAULT_NVR_NAME,
     PLACEHOLDERS,
     Config,
     ConfigError,
+    NvrConfig,
     Rule,
     load,
     resolve_path,
@@ -20,12 +24,17 @@ from .config import (
     validate_url_template,
 )
 from .events import EVENT_TYPES
-from .isapi import AuthError, NvrClient, NvrError
 
-NOTIFY_HINT = (
-    "Tip: on the NVR, enable 'Notify Surveillance Center' in the linkage/action\n"
-    "settings of each camera's Motion (or Smart Event), or no events will be sent."
-)
+NOTIFY_HINTS = {
+    "hikvision": (
+        "Tip: on the NVR, enable 'Notify Surveillance Center' in the linkage/action\n"
+        "settings of each camera's Motion (or Smart Event), or no events will be sent."
+    ),
+    "dahua": (
+        "Tip: on the NVR, enable Motion Detection (or the IVS / Smart Motion rule)\n"
+        "for each camera, or no events will be sent."
+    ),
+}
 
 TARGET_CHOICES = {
     "any": ([], "Any (no filter)"),
@@ -79,24 +88,25 @@ class Menu:
     # ----------------------------------------------------------------- main menu
 
     def run(self) -> int:
-        if not self.config.nvr.host:
+        if not self.config.nvrs:
             try:
-                self.configure_nvr()
+                self.configure_nvr(None)
             except Cancelled:
                 pass
         while True:
-            nvr = self.config.nvr.host or "not configured"
+            names = ", ".join(n.name for n in self.config.nvrs) or "not configured"
+            label = "NVRs" if len(self.config.nvrs) > 1 else "NVR"
             enabled = sum(r.enabled for r in self.config.rules)
             print()
             choice = questionary.select(
-                f"NVR: {nvr} | rules: {enabled} enabled / {len(self.config.rules)}",
+                f"{label}: {names} | rules: {enabled} enabled / {len(self.config.rules)}",
                 choices=[
                     Choice("Start forwarding events", "run"),
                     Choice("Manage forwarding rules", "rules"),
                     Choice("Watch live events (no forwarding)", "watch"),
                     Choice("List cameras", "cameras"),
                     Choice("Send a test request", "test"),
-                    Choice("Configure NVR connection", "nvr"),
+                    Choice("Manage NVRs", "nvrs"),
                     Choice("Quit", "quit"),
                 ],
             ).ask()
@@ -113,7 +123,7 @@ class Menu:
         if not any(r.enabled for r in self.config.rules):
             if not ask(questionary.confirm("No enabled rules. Start anyway?", default=False)):
                 return
-        info(f"Forwarding events. Press Ctrl+C to return to the menu.\n{NOTIFY_HINT}")
+        info(f"Forwarding events. Press Ctrl+C to return to the menu.\n{self._notify_hint()}")
         try:
             runner.run_forwarder(self.config)
         except AuthError as exc:
@@ -137,9 +147,15 @@ class Menu:
     def action_cameras(self) -> None:
         if not self._require_nvr():
             return
-        if self._fetch_cameras():
-            for cid, name in self.config.cameras.items():
-                print(f"  {cid:>3}  {name}")
+        fetched = False
+        for nvr in self.config.nvrs:
+            if len(self.config.nvrs) > 1:
+                info(f"{nvr.name} ({nvr.host}):")
+            if self._fetch_cameras(nvr):
+                fetched = True
+                for cid, name in nvr.cameras.items():
+                    print(f"  {cid:>3}  {name}")
+        if fetched:
             self.save()
 
     def action_test(self) -> None:
@@ -147,8 +163,33 @@ class Menu:
         if rule is not None:
             self._send_test(rule)
 
-    def action_nvr(self) -> None:
-        self.configure_nvr()
+    def action_nvrs(self) -> None:
+        while True:
+            choices = [
+                Choice(f"{n.name}  —  {BRANDS.get(n.brand, n.brand)} at {n.host}", n)
+                for n in self.config.nvrs
+            ]
+            choices += [Choice("+ Add an NVR", "add"), Choice("← Back", "back")]
+            picked = ask(questionary.select("NVRs:", choices=choices))
+            if picked == "back":
+                return
+            if picked == "add":
+                self.configure_nvr(None)
+                continue
+            action = ask(
+                questionary.select(
+                    f"NVR '{picked.name}':",
+                    choices=[
+                        Choice("Edit connection", "edit"),
+                        Choice("Remove", "remove"),
+                        Choice("← Back", "back"),
+                    ],
+                )
+            )
+            if action == "edit":
+                self.configure_nvr(picked)
+            elif action == "remove":
+                self._remove_nvr(picked)
 
     def action_rules(self) -> None:
         while True:
@@ -171,9 +212,27 @@ class Menu:
 
     # --------------------------------------------------------------- NVR setup
 
-    def configure_nvr(self) -> None:
-        nvr = copy.copy(self.config.nvr)
-        info("NVR connection (Hikvision / Annke / other ISAPI-compatible recorders)")
+    def configure_nvr(self, existing: NvrConfig | None) -> None:
+        """Add a new NVR (existing=None) or edit one, test it, and save."""
+        nvr = copy.deepcopy(existing) if existing else NvrConfig(name=self._suggest_nvr_name())
+        taken = {n.name for n in self.config.nvrs if n is not existing}
+        info("Edit NVR connection" if existing else "Add an NVR")
+        nvr.name = ask(
+            questionary.text(
+                "Name for this NVR (used in rules and logs):",
+                default=nvr.name,
+                validate=lambda s: (
+                    "Required" if not s.strip() else "Name already used" if s.strip() in taken else True
+                ),
+            )
+        ).strip()
+        nvr.brand = ask(
+            questionary.select(
+                "NVR brand:",
+                choices=[Choice(label, key) for key, label in BRANDS.items()],
+                default=nvr.brand if nvr.brand in BRANDS else "hikvision",
+            )
+        )
         nvr.host = ask(
             questionary.text(
                 "NVR IP address or hostname:",
@@ -208,7 +267,7 @@ class Menu:
             questionary.select(
                 "Authentication:",
                 choices=[
-                    Choice("Digest (standard for Hikvision/Annke)", "digest"),
+                    Choice("Digest (standard)", "digest"),
                     Choice("Basic (only if Digest fails)", "basic"),
                 ],
                 default=nvr.auth if nvr.auth in ("digest", "basic") else "digest",
@@ -216,9 +275,8 @@ class Menu:
         )
 
         info(f"Testing connection to {nvr.base_url} ...")
-        old_nvr, self.config.nvr = self.config.nvr, nvr
         try:
-            device = NvrClient(nvr).device_info()
+            device = make_client(nvr).device_info()
             ok(
                 "Connected: "
                 + " / ".join(
@@ -231,38 +289,68 @@ class Menu:
                     if v
                 )
             )
-            if self._fetch_cameras():
-                ok(f"Found {len(self.config.cameras)} camera(s).")
+            if self._fetch_cameras(nvr):
+                ok(f"Found {len(nvr.cameras)} camera(s).")
         except NvrError as exc:
             error(f"Connection test failed: {exc}")
             if not ask(questionary.confirm("Save these settings anyway?", default=False)):
-                self.config.nvr = old_nvr
                 return
-        self.save()
-        info(NOTIFY_HINT)
 
-    def _fetch_cameras(self) -> bool:
+        if existing is None:
+            self.config.nvrs.append(nvr)
+        else:
+            self.config.nvrs[self.config.nvrs.index(existing)] = nvr
+            if nvr.name != existing.name:
+                for rule in self.config.rules:
+                    if rule.nvr == existing.name:
+                        rule.nvr = nvr.name
+        self.save()
+        info(NOTIFY_HINTS.get(nvr.brand, NOTIFY_HINTS["hikvision"]))
+
+    def _suggest_nvr_name(self) -> str:
+        if not self.config.nvrs:
+            return DEFAULT_NVR_NAME
+        taken = {n.name for n in self.config.nvrs}
+        return next(f"NVR {i}" for i in range(2, len(taken) + 3) if f"NVR {i}" not in taken)
+
+    def _remove_nvr(self, nvr: NvrConfig) -> None:
+        users = [r.name for r in self.config.rules if r.nvr == nvr.name]
+        if users:
+            error(
+                f"These rules use '{nvr.name}': {', '.join(users)}. "
+                "Change them to another NVR or delete them first."
+            )
+            return
+        if ask(questionary.confirm(f"Remove NVR '{nvr.name}'?", default=False)):
+            self.config.nvrs.remove(nvr)
+            self.save()
+
+    def _fetch_cameras(self, nvr: NvrConfig) -> bool:
         try:
-            cameras = NvrClient(self.config.nvr).list_channels()
+            cameras = make_client(nvr).list_channels()
         except NvrError as exc:
-            error(f"Could not list cameras: {exc}")
+            error(f"Could not list cameras on {nvr.name}: {exc}")
             return False
         if not cameras:
-            error("The NVR did not report any channels.")
+            error(f"{nvr.name} did not report any channels.")
             return False
-        self.config.cameras = cameras
+        nvr.cameras = cameras
         return True
 
+    def _notify_hint(self) -> str:
+        brands = dict.fromkeys(n.brand for n in self.config.nvrs) or {"hikvision": None}
+        return "\n".join(NOTIFY_HINTS.get(b, NOTIFY_HINTS["hikvision"]) for b in brands)
+
     def _require_nvr(self) -> bool:
-        if self.config.nvr.host:
+        if self.config.nvrs:
             return True
-        error("Configure the NVR connection first.")
+        error("Add an NVR first (Manage NVRs).")
         return False
 
     # ------------------------------------------------------------------- rules
 
     def _rule_summary(self, rule: Rule) -> str:
-        cams = ", ".join(self.config.camera_name(c) for c in rule.channels) or "all cameras"
+        cams = runner.describe_cameras(self.config, rule)
         events = ", ".join(EVENT_TYPES.get(e, e) for e in rule.event_types)
         target = f" [{'/'.join(rule.targets)}]" if rule.targets else ""
         return f"{events}{target} on {cams}"
@@ -325,7 +413,16 @@ class Menu:
             )
         ).strip()
 
-        rule.channels = self._ask_channels(rule.channels)
+        if len(self.config.nvrs) > 1:
+            rule.nvr = ask(
+                questionary.select(
+                    "Which NVR should this rule listen to?",
+                    choices=[Choice("All NVRs", "")]
+                    + [Choice(n.name, n.name) for n in self.config.nvrs],
+                    default=rule.nvr if self.config.get_nvr(rule.nvr) else "",
+                )
+            )
+        rule.channels = self._ask_channels(rule.nvr, rule.channels)
 
         choices = [
             Choice(f"{label} ({code})", code, checked=code in rule.event_types)
@@ -410,12 +507,15 @@ class Menu:
             rule.off_url = ""
         return rule
 
-    def _ask_channels(self, current: list[int]) -> list[int]:
-        if not self.config.cameras and self.config.nvr.host:
-            info("Fetching cameras from the NVR ...")
-            self._fetch_cameras()
+    def _ask_channels(self, nvr_name: str, current: list[int]) -> list[int]:
+        nvr = self.config.get_nvr(nvr_name)
+        if nvr is not None and not nvr.cameras:
+            info(f"Fetching cameras from {nvr.name} ...")
+            self._fetch_cameras(nvr)
 
-        if not self.config.cameras:
+        if nvr is None or not nvr.cameras:
+            if nvr is None and len(self.config.nvrs) > 1:
+                info("Channel numbers apply to every NVR.")
             raw = ask(
                 questionary.text(
                     "Channel numbers, comma-separated (blank = all cameras):",
@@ -440,7 +540,7 @@ class Menu:
                 "Select cameras (space to select, enter to confirm):",
                 choices=[
                     Choice(f"{cid:>3}  {name}", cid, checked=cid in current)
-                    for cid, name in self.config.cameras.items()
+                    for cid, name in nvr.cameras.items()
                 ],
                 validate=lambda sel: bool(sel) or "Pick at least one",
             )

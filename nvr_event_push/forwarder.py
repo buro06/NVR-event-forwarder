@@ -21,15 +21,21 @@ log = logging.getLogger(__name__)
 RETRY_BACKOFF = 1.0
 
 
+# Cooldowns are tracked per rule index, NVR name and channel.
+CooldownKey = tuple[int, str, int | None]
+
+
 def template_context(config: Config, rule: Rule, event: Event) -> dict[str, str]:
+    nvr = config.get_nvr(event.nvr)
     return {
-        "camera_name": config.camera_name(event.channel),
+        "camera_name": config.camera_name(event.nvr, event.channel),
         "channel": "" if event.channel is None else str(event.channel),
         "event_type": event.event_type,
         "event_label": event.label,
         "target": event.target or "",
         "timestamp": event.timestamp,
-        "nvr_host": config.nvr.host,
+        "nvr_name": nvr.name if nvr is not None else event.nvr,
+        "nvr_host": nvr.host if nvr is not None else "",
         "rule_name": rule.name,
     }
 
@@ -42,6 +48,8 @@ def build_url(template: str, context: dict[str, str]) -> str:
 
 def rule_matches(rule: Rule, event: Event) -> bool:
     if not rule.enabled:
+        return False
+    if rule.nvr and event.nvr != rule.nvr:
         return False
     if rule.channels and event.channel not in rule.channels:
         return False
@@ -69,7 +77,7 @@ class _PendingOff:
     url: str
     # Cooldown entries to clear when the off request goes out, so the next
     # event turns the light back on instead of being swallowed by the cooldown.
-    cooldown_keys: set[tuple[int, int | None]] = field(default_factory=set)
+    cooldown_keys: set[CooldownKey] = field(default_factory=set)
 
 
 class Forwarder:
@@ -88,10 +96,10 @@ class Forwarder:
         self.timer_factory = timer_factory
         self.sleep = sleep
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="push")
-        self._last_fired: dict[tuple[int, int | None], float] = {}
+        self._last_fired: dict[CooldownKey, float] = {}
         # Events swallowed by the cooldown since the last request, so the
         # once-a-second repeats the NVR sends during motion are logged once.
-        self._suppressed: dict[tuple[int, int | None], int] = {}
+        self._suppressed: dict[CooldownKey, int] = {}
         # Keyed by rule index + off URL rendered without the timestamp: cameras
         # whose off URL comes out the same (one light) share a timer, while a
         # URL containing {camera_name} gets a timer per camera.
@@ -106,7 +114,7 @@ class Forwarder:
         for idx, rule in enumerate(self.config.rules):
             if not rule_matches(rule, event):
                 continue
-            key = (idx, event.channel)
+            key = (idx, event.nvr, event.channel)
             if rule.off_url:
                 # Every matching event, even one in cooldown, pushes the off back.
                 self._schedule_off(idx, rule, event, key)
@@ -128,9 +136,10 @@ class Forwarder:
                 log.debug("Rule '%s' on channel %s: %d repeat(s) ignored during cooldown",
                           rule.name, event.channel, repeats)
             log.info(
-                "%s on %s (ch %s%s) -> rule '%s'",
+                "%s on %s (%sch %s%s) -> rule '%s'",
                 event.label,
-                self.config.camera_name(event.channel),
+                self.config.camera_name(event.nvr, event.channel),
+                f"{event.nvr} " if len(self.config.nvrs) > 1 else "",
                 event.channel,
                 f", {event.target}" if event.target else "",
                 rule.name,
@@ -143,7 +152,7 @@ class Forwarder:
         url = build_url(template, template_context(self.config, rule, event))
         return self._pool.submit(self._send, rule, url)
 
-    def _schedule_off(self, idx: int, rule: Rule, event: Event, key: tuple[int, int | None]) -> None:
+    def _schedule_off(self, idx: int, rule: Rule, event: Event, key: CooldownKey) -> None:
         context = template_context(self.config, rule, event)
         timer_key = (idx, build_url(rule.off_url, {**context, "timestamp": ""}))
         with self._lock:

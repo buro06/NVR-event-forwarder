@@ -9,14 +9,26 @@ from nvr_event_push.events import Event
 from nvr_event_push.forwarder import Forwarder, build_url, rule_matches
 
 
-def ev(channel=1, event_type="VMD", state="active", target=None):
+def ev(channel=1, event_type="VMD", state="active", target=None, nvr=""):
     return Event(channel=channel, event_type=event_type, state=state, target=target,
-                 timestamp="2026-10-18T21:30:01+01:00")
+                 timestamp="2026-10-18T21:30:01+01:00", nvr=nvr)
 
 
 def make_config(**rule_kw):
     rule = Rule(name="Lights", url="http://h/m?cam={camera_name}&t={timestamp}", **rule_kw)
-    return Config(nvr=NvrConfig(host="nvr.local"), rules=[rule], cameras={1: "Front Door"})
+    return Config(nvrs=[NvrConfig(host="nvr.local", cameras={1: "Front Door"})], rules=[rule])
+
+
+def two_nvr_config(**rule_kw):
+    rule = Rule(name="Lights", url="http://h/m?n={nvr_name}&h={nvr_host}&cam={camera_name}",
+                **rule_kw)
+    return Config(
+        nvrs=[
+            NvrConfig(name="House", host="10.0.0.2", cameras={1: "Driveway"}),
+            NvrConfig(name="Garage", host="10.0.0.3", brand="dahua", cameras={1: "Side gate"}),
+        ],
+        rules=[rule],
+    )
 
 
 def test_build_url_encodes_values():
@@ -99,10 +111,88 @@ def test_config_roundtrip(tmp_path):
     assert loaded == config
 
 
+def test_brand_defaults_and_validation(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("nvr:\n  host: 10.0.0.2\n")
+    assert load(path).nvrs[0].brand == "hikvision"  # configs from before brands existed
+    path.write_text("nvr:\n  host: 10.0.0.2\n  brand: Dahua\n")
+    assert load(path).nvrs[0].brand == "dahua"
+    path.write_text("nvr:\n  host: 10.0.0.2\n  brand: acme\n")
+    with pytest.raises(ConfigError, match="brand"):
+        load(path)
+
+
+def test_single_nvr_config_is_migrated(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "nvr:\n  host: 10.0.0.2\n  password: pw\n"
+        "cameras:\n  1: Driveway\n"
+        "rules:\n  - name: R\n    url: http://h/x\n    channels: [1]\n    event_types: [VMD]\n"
+    )
+    config = load(path)
+    (nvr,) = config.nvrs
+    assert (nvr.name, nvr.host, nvr.password, nvr.cameras) == ("NVR", "10.0.0.2", "pw", {1: "Driveway"})
+    assert config.rules[0].nvr == ""
+    save(config, path)
+    assert "nvrs:" in path.read_text()
+    assert load(path) == config
+
+
+def test_unconfigured_single_nvr_is_dropped(tmp_path):
+    # Older versions saved an empty `nvr:` block before the NVR was set up.
+    path = tmp_path / "c.yaml"
+    path.write_text("nvr:\n  host: ''\ncameras: {}\n")
+    assert load(path).nvrs == []
+
+
+def test_multi_nvr_roundtrip_and_validation(tmp_path):
+    config = two_nvr_config(nvr="Garage", channels=[1])
+    path = save(config, tmp_path / "c.yaml")
+    assert load(path) == config
+
+    config.rules[0].nvr = "Shed"
+    save(config, path)
+    with pytest.raises(ConfigError, match="unknown NVR 'Shed'"):
+        load(path)
+    config.rules[0].nvr = ""
+    config.nvrs[1].name = "House"
+    save(config, path)
+    with pytest.raises(ConfigError, match="Duplicate NVR name"):
+        load(path)
+
+
+def test_rule_nvr_filter_and_cooldown_per_nvr():
+    config = two_nvr_config(channels=[1])
+    rule = config.rules[0]
+    assert rule_matches(rule, ev(nvr="House")) and rule_matches(rule, ev(nvr="Garage"))
+    rule.nvr = "Garage"
+    assert not rule_matches(rule, ev(nvr="House"))
+    assert rule_matches(rule, ev(nvr="Garage"))
+
+    rule.nvr = ""
+    session = mock.Mock()
+    session.get.return_value = mock.Mock(status_code=200, ok=True)
+    fwd = Forwarder(config, session=session)
+    # Channel 1 on each NVR is a different camera, so each gets its own cooldown.
+    for nvr in ("House", "Garage", "House", "Garage"):
+        for f in fwd.handle(ev(nvr=nvr)):
+            f.result()
+    fwd.shutdown()
+    urls = [c.args[0] for c in session.get.call_args_list]
+    assert urls == [
+        "http://h/m?n=House&h=10.0.0.2&cam=Driveway",
+        "http://h/m?n=Garage&h=10.0.0.3&cam=Side%20gate",
+    ]
+
+
 def test_password_env_override(monkeypatch):
     nvr = NvrConfig(password="file")
     assert nvr.effective_password == "file"
     monkeypatch.setenv("NVR_PASSWORD", "env")
+    assert nvr.effective_password == "env"
+    garage = NvrConfig(name="Back garage", password="file")
+    monkeypatch.setenv("NVR_PASSWORD_BACK_GARAGE", "garage-env")
+    assert garage.effective_password == "garage-env"
     assert nvr.effective_password == "env"
 
 
