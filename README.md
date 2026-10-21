@@ -13,6 +13,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .            # or: pip install -e '.[dev]' for tests
 ```
 
+**Windows**: install Python 3.10+ from python.org, then double-click `nvr-event-push.cmd` to open the menu. The first run creates `.venv` and installs everything. From a Command Prompt, pass the usual arguments, e.g. `nvr-event-push.cmd run`. The config is kept in `config.yaml` next to the `.cmd` file unless you pass `-c` or set `NVR_EVENT_PUSH_CONFIG`.
+
 ## Prepare the NVR
 
 Each NVR has a `brand`: `hikvision` (the default) or `dahua`. The interactive menu asks for it when you add the NVR.
